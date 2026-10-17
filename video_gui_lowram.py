@@ -1,5 +1,10 @@
 import os
-os.environ["HF_HOME"] = r"E:\hf_cache"   # кеш моделі на диск E
+import sys
+
+# Add E:\VideoAi2 to Python path so it can easily find tiktoken and other local packages
+sys.path.append(r"E:\VideoAi2")
+
+os.environ["HF_HOME"] = r"E:\hf_cache"   # model cache on E drive
 
 import gc
 import queue
@@ -8,19 +13,14 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-# Встановлення (в папці на диску E, відкрити cmd з адресного рядка):
-#   py -m pip install -U --target . diffusers transformers accelerate sentencepiece imageio imageio-ffmpeg deep-translator bitsandbytes
-#   py -m pip install -U --target . torch --index-url https://download.pytorch.org/whl/cu126
-
 FPS = 24
 RATIOS = {
-    "16:9 (горизонтальне)": (16, 9),
-    "9:16 (вертикальне)": (9, 16),
-    "1:1 (квадрат)": (1, 1),
+    "16:9 (landscape)": (16, 9),
+    "9:16 (portrait)": (9, 16),
+    "1:1 (square)": (1, 1),
     "4:3": (4, 3),
     "3:4": (3, 4),
 }
-# довша сторона відео в пікселях (чим менше, тим менше пам'яті)
 SIZES = ["384", "448", "512", "640", "704"]
 
 pipe = None
@@ -44,15 +44,14 @@ def calc_size(ratio, long_side):
 
 def calc_frames(seconds):
     n = max(1, round((seconds * FPS - 1) / 8))
-    return 8 * n + 1          # кількість кадрів має бути 8*n+1
+    return 8 * n + 1          
 
 
 def translate(text):
-    """Google, а якщо ліміт, то запасний MyMemory. Якщо обидва не вийшли, текст як є."""
     from deep_translator import GoogleTranslator, MyMemoryTranslator
     makers = (
-        ("Google", lambda: GoogleTranslator(source="uk", target="en")),
-        ("MyMemory", lambda: MyMemoryTranslator(source="uk-UA", target="en-GB")),
+        ("Google", lambda: GoogleTranslator(source="auto", target="en")),
+        ("MyMemory", lambda: MyMemoryTranslator(source="autodetect", target="en-GB")),
     )
     for name, make in makers:
         for _ in range(2):
@@ -61,14 +60,13 @@ def translate(text):
                 if res:
                     return res
             except Exception as e:
-                q.put(("log", f"Переклад ({name}) не вдався: {str(e)[:80]}"))
+                q.put(("log", f"Translation ({name}) failed: {str(e)[:80]}"))
                 time.sleep(2)
-    q.put(("log", "Беру промпт як є (українською), якість може бути гіршою"))
+    q.put(("log", "Using prompt as is, quality might be affected"))
     return text
 
 
 def load_pipe():
-    """Завантажує стиснуту модель: T5 у 4-біт, трансформер у 8-біт (мало RAM)."""
     global pipe
     if pipe is not None:
         return pipe
@@ -81,12 +79,12 @@ def load_pipe():
 
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "Не знайдено CUDA. Поставте torch з CUDA:\n"
+            "CUDA not found. Install PyTorch with CUDA support:\n"
             "py -m pip install -U --target . torch "
             "--index-url https://download.pytorch.org/whl/cu126"
         )
 
-    q.put(("status", "Завантаження стиснутої моделі (перший раз довго)..."))
+    q.put(("status", "Loading compressed model (first time takes longer)..."))
     repo = "Lightricks/LTX-Video"
 
     text_encoder = T5EncoderModel.from_pretrained(
@@ -120,21 +118,21 @@ def worker(prompt_ua, ratio, long_side, seconds, steps, seed):
         import torch
         from diffusers.utils import export_to_video
 
-        q.put(("status", "Переклад промпта..."))
+        q.put(("status", "Processing prompt..."))
         prompt = translate(prompt_ua)
-        q.put(("log", f"Промпт для моделі: {prompt}"))
+        q.put(("log", f"Model prompt: {prompt}"))
 
         p = load_pipe()
         w, h = calc_size(ratio, long_side)
         frames = calc_frames(seconds)
-        q.put(("log", f"Розмір {w}x{h}, кадрів {frames} (~{frames / FPS:.1f} c)"))
+        q.put(("log", f"Resolution {w}x{h}, frames {frames} (~{frames / FPS:.1f} s)"))
 
         def on_step(pipeline, step, timestep, kwargs):
-            q.put(("status", f"Генерація: крок {step + 1}/{steps}"))
+            q.put(("status", f"Generating: step {step + 1}/{steps}"))
             return kwargs
 
         gen = torch.Generator(device="cpu").manual_seed(seed)
-        q.put(("status", "Генерація..."))
+        q.put(("status", "Generating..."))
         video = p(
             prompt=prompt,
             negative_prompt="worst quality, blurry, jittery, distorted",
@@ -156,88 +154,85 @@ def worker(prompt_ua, ratio, long_side, seconds, steps, seed):
     except Exception as e:
         msg = str(e)
         if "out of memory" in msg.lower():
-            msg = ("Не вистачило пам'яті. Зменште розмір, секунди або "
-                   "кроки, закрийте браузер і спробуйте знову.")
+            msg = ("Out of memory. Decrease resolution, seconds or steps, "
+                   "close your browser and try again.")
         q.put(("error", msg))
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Генератор відео (мало RAM)")
+        self.title("AI Video Generator (Low RAM)")
         self.geometry("620x640")
         self.minsize(560, 600)
         pad = {"padx": 10, "pady": 4}
 
-        ttk.Label(self, text="Промпт (можна українською):").pack(anchor="w", **pad)
+        ttk.Label(self, text="Prompt (English recommended):").pack(anchor="w", **pad)
         self.prompt = tk.Text(self, height=6, wrap="word", font=("Segoe UI", 11))
         self.prompt.pack(fill="x", **pad)
-        self.prompt.insert("1.0", "Дівчина в червоному пальті йде засніженим "
-                                  "лісом на світанку, м'яке золоте світло, "
-                                  "кінематографічно")
-        # Ctrl+V працює і на українській розкладці
+        self.prompt.insert("1.0", "A girl in a red coat walking through a snowy forest at dawn, "
+                                  "soft golden light, cinematic")
         self.prompt.bind("<Control-KeyPress>", self.on_ctrl_key)
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=10, pady=2)
-        ttk.Button(btns, text="Вставити з буфера",
+        ttk.Button(btns, text="Paste from Clipboard",
                    command=self.paste_prompt).pack(side="left")
-        ttk.Button(btns, text="Очистити",
+        ttk.Button(btns, text="Clear",
                    command=self.clear_prompt).pack(side="left", padx=6)
 
         grid = ttk.Frame(self)
         grid.pack(fill="x", **pad)
 
-        ttk.Label(grid, text="Формат:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(grid, text="Aspect Ratio:").grid(row=0, column=0, sticky="w", pady=4)
         self.ratio = ttk.Combobox(grid, values=list(RATIOS), state="readonly", width=24)
         self.ratio.current(1)
         self.ratio.grid(row=0, column=1, sticky="w", padx=8)
 
-        ttk.Label(grid, text="Секунд:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(grid, text="Seconds:").grid(row=1, column=0, sticky="w", pady=4)
         self.seconds = tk.Spinbox(grid, from_=1, to=10, increment=1, width=6)
         self.seconds.delete(0, "end")
         self.seconds.insert(0, "1")
         self.seconds.grid(row=1, column=1, sticky="w", padx=8)
 
-        ttk.Label(grid, text="Розмір (довша сторона):").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(grid, text="Resolution (Longest side):").grid(row=2, column=0, sticky="w", pady=4)
         self.size = ttk.Combobox(grid, values=SIZES, state="readonly", width=8)
         self.size.current(0)
         self.size.grid(row=2, column=1, sticky="w", padx=8)
 
-        ttk.Label(grid, text="Кроки (якість):").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Label(grid, text="Steps (Quality):").grid(row=3, column=0, sticky="w", pady=4)
         self.steps = tk.Spinbox(grid, from_=10, to=50, increment=5, width=6)
         self.steps.delete(0, "end")
         self.steps.insert(0, "30")
         self.steps.grid(row=3, column=1, sticky="w", padx=8)
 
-        ttk.Label(grid, text="Seed (порожньо = випадковий):").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Label(grid, text="Seed (empty = random):").grid(row=4, column=0, sticky="w", pady=4)
         self.seed = ttk.Entry(grid, width=10)
         self.seed.grid(row=4, column=1, sticky="w", padx=8)
 
-        self.btn = ttk.Button(self, text="Згенерувати", command=self.start)
+        self.btn = ttk.Button(self, text="Generate", command=self.start)
         self.btn.pack(fill="x", padx=10, pady=8)
 
         self.bar = ttk.Progressbar(self, mode="indeterminate")
         self.bar.pack(fill="x", **pad)
-        self.status = ttk.Label(self, text="Готово до роботи")
+        self.status = ttk.Label(self, text="Ready")
         self.status.pack(anchor="w", **pad)
 
         self.log = tk.Text(self, height=9, wrap="word", state="disabled",
                            font=("Consolas", 9))
         self.log.pack(fill="both", expand=True, **pad)
 
-        self.open_btn = ttk.Button(self, text="Відкрити папку з відео",
+        self.open_btn = ttk.Button(self, text="Open Video Folder",
                                    command=self.open_folder)
         self.open_btn.pack(fill="x", padx=10, pady=(0, 10))
 
         self.after(200, self.poll)
 
     def paste_prompt(self):
-        """Кнопка: замінює весь текст у полі на вміст буфера обміну."""
         try:
             text = self.clipboard_get()
         except tk.TclError:
-            messagebox.showinfo("Буфер порожній", "Спочатку скопіюйте текст.")
+            messagebox.showinfo("Clipboard Empty", "Copy some text first.")
             return
         self.prompt.delete("1.0", "end")
         self.prompt.insert("1.0", text.strip())
@@ -247,8 +242,7 @@ class App(tk.Tk):
         self.prompt.focus_set()
 
     def on_ctrl_key(self, event):
-        """Ctrl+V / Ctrl+C / Ctrl+A за кодом клавіші, щоб працювало з УКР розкладкою."""
-        if event.keycode == 86:      # V
+        if event.keycode == 86:
             try:
                 text = self.clipboard_get()
             except tk.TclError:
@@ -259,14 +253,14 @@ class App(tk.Tk):
                 pass
             self.prompt.insert("insert", text)
             return "break"
-        if event.keycode == 67:      # C
+        if event.keycode == 67:
             try:
                 self.clipboard_clear()
                 self.clipboard_append(self.prompt.get("sel.first", "sel.last"))
             except tk.TclError:
                 pass
             return "break"
-        if event.keycode == 65:      # A
+        if event.keycode == 65:
             self.prompt.tag_add("sel", "1.0", "end-1c")
             return "break"
 
@@ -279,7 +273,7 @@ class App(tk.Tk):
     def start(self):
         text = self.prompt.get("1.0", "end").strip()
         if not text:
-            messagebox.showwarning("Увага", "Введіть промпт.")
+            messagebox.showwarning("Warning", "Please enter a prompt.")
             return
         try:
             seconds = int(self.seconds.get())
@@ -287,14 +281,14 @@ class App(tk.Tk):
             seed_txt = self.seed.get().strip()
             seed = int(seed_txt) if seed_txt else int(time.time()) % 100000
         except ValueError:
-            messagebox.showwarning("Увага", "Секунди, кроки і seed мають бути числами.")
+            messagebox.showwarning("Warning", "Seconds, steps and seed must be numbers.")
             return
 
         ratio = RATIOS[self.ratio.get()]
         long_side = int(self.size.get())
         self.btn.config(state="disabled")
         self.bar.start(12)
-        self.write("--- Старт ---")
+        self.write("--- Start ---")
         threading.Thread(
             target=worker,
             args=(text, ratio, long_side, seconds, steps, seed),
@@ -311,18 +305,18 @@ class App(tk.Tk):
                     self.write(data)
                 elif kind == "done":
                     self.finish()
-                    self.status.config(text="Готово!")
-                    self.write(f"Збережено: {data}")
-                    messagebox.showinfo("Готово", f"Відео збережено:\n{data}")
+                    self.status.config(text="Ready!")
+                    self.write(f"Saved: {data}")
+                    messagebox.showinfo("Done", f"Video saved to:\n{data}")
                     try:
                         os.startfile(data)
                     except Exception:
                         pass
                 elif kind == "error":
                     self.finish()
-                    self.status.config(text="Помилка")
-                    self.write(f"ПОМИЛКА: {data}")
-                    messagebox.showerror("Помилка", data)
+                    self.status.config(text="Error")
+                    self.write(f"ERROR: {data}")
+                    messagebox.showerror("Error", data)
         except queue.Empty:
             pass
         self.after(200, self.poll)
